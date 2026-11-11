@@ -23,6 +23,26 @@ fn main() {
 - `PluginMode::ReplaceDefault` will embed the asset folder and make it available through the default source
 - `PluginMode::ReplaceAndFallback` will embed the asset folder and make it available through the default source. If a fail is not found at runtime, it fallback to the default source for the current platform
 
+## Compression and Encryption
+
+Assets can be compressed with zstd (`compression` feature) and/or encrypted with ChaCha20-Poly1305 (`encryption` feature). This happens at build time and is configured with environment variables:
+
+- `BEVY_EMBEDDED_ASSETS_KEY`: passphrase used for encryption, required with `encryption`
+- `BEVY_EMBEDDED_ASSETS_ZSTD_LEVEL`: compression level from 1 to 22, defaults to 19
+- `BEVY_EMBEDDED_ASSETS_COMPRESS_SKIP`: comma-separated list of extensions not to compress, defaults to `png,jpg,jpeg,webp,ktx2,basis,dds,glb,ogg,mp3,flac,opus,m4a,mp4,webm,zip,gz,zst,br,woff2`
+
+When using encryption, pass the same passphrase to the plugin:
+
+```rust,ignore
+App::new().add_plugins((
+    EmbeddedAssetPlugin {
+        encryption_key: Some(my_key.to_string()),
+        ..default()
+    },
+    DefaultPlugins,
+));
+```
+
 ## Bevy Compatibility
 
 | Bevy | bevy_embedded_assets |

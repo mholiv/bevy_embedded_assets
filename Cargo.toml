@@ -16,6 +16,10 @@ categories = ["game-development"]
 default = ["default-source"]
 # Support for replacing the default asset source
 default-source = ["futures-io", "futures-lite", "log"]
+# Compress embedded assets with zstd
+compression = ["dep:structured-zstd", "log"]
+# Encrypt embedded assets with ChaCha20-Poly1305
+encryption = ["dep:chacha20poly1305", "dep:blake3", "log"]
 
 [dependencies]
 bevy_asset = { version = "0.20", default-features = false }
@@ -26,12 +30,25 @@ futures-io = { version = "0.3", optional = true }
 futures-lite = { version = "2.6", optional = true }
 log = { version = "0.4", optional = true }
 thiserror = "2.0"
+# Only decoding happens at runtime, the default features pull in encoder dependencies
+structured-zstd = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "kernel-scalar",
+  "kernel-avx2",
+  "kernel-sve",
+  "kernel-simd128",
+] }
+chacha20poly1305 = { version = "0.10", optional = true }
+blake3 = { version = "1.8", optional = true }
 
 [dev-dependencies]
 bevy = { version = "0.20", default-features = false, features = ["bevy_asset"] }
 
 [build-dependencies]
 cargo-emit = "0.2.1"
+structured-zstd = { version = "0.3", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+blake3 = { version = "1.8", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

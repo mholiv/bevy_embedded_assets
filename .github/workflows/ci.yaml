@@ -33,6 +33,11 @@ jobs:
         run: sudo apt-get update; sudo apt-get install pkg-config libx11-dev libasound2-dev libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Run cargo test
         run: cargo test
+      - name: Run cargo test with compression and encryption
+        run: cargo test --all-features
+        env:
+          # Same key as `KEY` in tests/encoded.rs
+          BEVY_EMBEDDED_ASSETS_KEY: TEST_KEY
 
   wasm-test:
     strategy:
@@ -85,6 +90,10 @@ jobs:
         run: sudo apt-get update; sudo apt-get install pkg-config libx11-dev libasound2-dev libudev-dev
       - name: Run clippy
         run: cargo clippy -- -D warnings
+      - name: Run clippy with all features
+        run: cargo clippy --all-features --all-targets -- -D warnings
+        env:
+          BEVY_EMBEDDED_ASSETS_KEY: TEST_KEY
 
   format:
     name: Format

@@ -50,6 +50,7 @@ impl bevy::asset::AssetLoader for TestAssetLoader {
 }
 
 #[test]
+#[cfg_attr(feature = "encryption", ignore = "no encryption key")]
 fn work_with_embedded_source_plugin_before() {
     let mut app = App::new();
     app.add_plugins(EmbeddedAssetPlugin::default())
@@ -73,6 +74,7 @@ fn work_with_embedded_source_plugin_before() {
 }
 
 #[test]
+#[cfg_attr(feature = "encryption", ignore = "no encryption key")]
 fn work_with_embedded_source_plugin_after() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)

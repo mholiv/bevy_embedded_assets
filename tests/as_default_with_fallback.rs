@@ -1,3 +1,5 @@
+// `..default()` fills `encryption_key` when that feature is on.
+#![allow(clippy::needless_update)]
 #![cfg(feature = "default-source")]
 
 use std::fmt::Display;
@@ -52,12 +54,14 @@ impl bevy::asset::AssetLoader for TestAssetLoader {
 }
 
 #[test]
+#[cfg_attr(feature = "encryption", ignore = "no encryption key")]
 fn work_with_embedded_source_plugin_before() {
     let mut app = App::new();
     app.add_plugins(EmbeddedAssetPlugin {
         mode: PluginMode::ReplaceAndFallback {
             path: "runtime_assets".to_string(),
         },
+        ..default()
     })
     .add_plugins(DefaultPlugins.set(AssetPlugin {
         file_path: "runtime_assets".to_string(),

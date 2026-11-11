@@ -13,7 +13,7 @@
     clippy::pedantic
 )]
 
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use bevy_app::App;
 use bevy_app::Plugin;
@@ -31,6 +31,7 @@ use {
 
 #[cfg(feature = "default-source")]
 mod asset_reader;
+mod codec;
 #[cfg(feature = "default-source")]
 pub use {asset_reader::DataReader, asset_reader::EmbeddedAssetReader};
 
@@ -70,7 +71,7 @@ include!(concat!(env!("OUT_DIR"), "/include_all_assets.rs"));
 /// # pub struct MyAsset;
 /// # fn main() {
 /// # let mut app = App::new();
-/// app.add_plugins((EmbeddedAssetPlugin { mode: PluginMode::ReplaceDefault }, DefaultPlugins));
+/// app.add_plugins((EmbeddedAssetPlugin { mode: PluginMode::ReplaceDefault, ..default() }, DefaultPlugins));
 /// # app.init_asset::<MyAsset>();
 /// # let asset_server: Mut<'_, AssetServer> = app.world_mut().resource_mut::<AssetServer>();
 /// let handle: Handle<MyAsset> = asset_server.load("example_asset.test");
@@ -83,6 +84,19 @@ include!(concat!(env!("OUT_DIR"), "/include_all_assets.rs"));
 pub struct EmbeddedAssetPlugin {
     /// How this plugin should behave.
     pub mode: PluginMode,
+    /// Passphrase used to decrypt assets, the one set in `BEVY_EMBEDDED_ASSETS_KEY` at build time.
+    #[cfg(feature = "encryption")]
+    pub encryption_key: Option<String>,
+}
+
+impl EmbeddedAssetPlugin {
+    #[allow(clippy::unused_self)]
+    fn key(&self) -> Option<codec::Key> {
+        #[cfg(feature = "encryption")]
+        return self.encryption_key.as_deref().map(codec::derive_key);
+        #[cfg(not(feature = "encryption"))]
+        None
+    }
 }
 
 /// How [`EmbeddedAssetPlugin`] should behave.
@@ -113,12 +127,21 @@ pub enum PluginMode {
 struct AllTheEmbedded;
 
 trait EmbeddedRegistry {
-    fn insert_included_asset(&mut self, name: &'static str, bytes: &'static [u8]);
+    fn insert_included_asset(&mut self, name: &'static str, bytes: &'static [u8], compressed: bool);
 }
 
-impl EmbeddedRegistry for &mut EmbeddedAssetRegistry {
-    fn insert_included_asset(&mut self, name: &str, bytes: &'static [u8]) {
-        self.insert_asset(PathBuf::new(), std::path::Path::new(name), bytes);
+impl EmbeddedRegistry for (&mut EmbeddedAssetRegistry, Option<codec::Key>) {
+    fn insert_included_asset(&mut self, name: &str, bytes: &'static [u8], compressed: bool) {
+        let path = std::path::Path::new(name);
+        // Bevy's registry holds bytes, so assets are decoded here instead of when read.
+        match codec::decode(bytes, compressed, self.1.as_ref()) {
+            Ok(Cow::Borrowed(raw)) => self.0.insert_asset(PathBuf::new(), path, raw),
+            Ok(Cow::Owned(decoded)) => self.0.insert_asset(PathBuf::new(), path, decoded),
+            #[cfg(any(feature = "compression", feature = "encryption"))]
+            Err(err) => log::error!("failed to decode embedded asset {name}: {err}"),
+            #[cfg(not(any(feature = "compression", feature = "encryption")))]
+            Err(_) => unreachable!("raw assets never fail to decode"),
+        }
     }
 }
 
@@ -127,8 +150,9 @@ impl Plugin for EmbeddedAssetPlugin {
         match &self.mode {
             PluginMode::AutoLoad => {
                 if app.is_plugin_added::<AssetPlugin>() {
+                    let key = self.key();
                     let mut registry = app.world_mut().resource_mut::<EmbeddedAssetRegistry>();
-                    include_all_assets(registry.as_mut());
+                    include_all_assets((registry.as_mut(), key));
                     app.init_resource::<AllTheEmbedded>();
                 }
             }
@@ -139,10 +163,15 @@ impl Plugin for EmbeddedAssetPlugin {
                         "plugin EmbeddedAssetPlugin must be added before plugin AssetPlugin when replacing the default asset source"
                     );
                 }
+                let key = self.key();
                 app.register_asset_source(
                     AssetSourceId::Default,
-                    AssetSourceBuilder::new(|| Box::new(EmbeddedAssetReader::preloaded()))
-                        .with_processed_reader(|| Box::new(EmbeddedAssetReader::preloaded())),
+                    AssetSourceBuilder::new(move || {
+                        Box::new(EmbeddedAssetReader::preloaded().with_key_opt(key))
+                    })
+                    .with_processed_reader(move || {
+                        Box::new(EmbeddedAssetReader::preloaded().with_key_opt(key))
+                    }),
                 );
             }
             #[cfg(feature = "default-source")]
@@ -153,12 +182,16 @@ impl Plugin for EmbeddedAssetPlugin {
                     );
                 }
                 let path = path.clone();
+                let key = self.key();
                 app.register_asset_source(
                     AssetSourceId::Default,
                     AssetSourceBuilder::new(move || {
-                        Box::new(EmbeddedAssetReader::preloaded_with_default(
-                            AssetSource::get_default_reader(path.clone()),
-                        ))
+                        Box::new(
+                            EmbeddedAssetReader::preloaded_with_default(
+                                AssetSource::get_default_reader(path.clone()),
+                            )
+                            .with_key_opt(key),
+                        )
                     }),
                 );
             }
@@ -172,8 +205,9 @@ impl Plugin for EmbeddedAssetPlugin {
                 .remove_resource::<AllTheEmbedded>()
                 .is_none()
         {
+            let key = self.key();
             let mut registry = app.world_mut().resource_mut::<EmbeddedAssetRegistry>();
-            include_all_assets(registry.as_mut());
+            include_all_assets((registry.as_mut(), key));
         }
     }
 }

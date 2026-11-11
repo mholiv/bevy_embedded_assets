@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
@@ -8,13 +9,13 @@ use std::{
 
 use bevy_asset::io::{
     AssetReader, AssetReaderError, ErasedAssetReader, PathStream, Reader, ReaderNotSeekableError,
-    SeekableReader,
+    SeekableReader, VecReader,
 };
 use futures_io::{AsyncRead, AsyncSeek};
 use futures_lite::Stream;
 use thiserror::Error;
 
-use crate::{EmbeddedRegistry, include_all_assets};
+use crate::{EmbeddedRegistry, codec, include_all_assets};
 
 /// Struct which can be used to retrieve embedded assets directly
 /// without the normal Bevy `Handle<T>` approach.  This is useful
@@ -37,8 +38,10 @@ use crate::{EmbeddedRegistry, include_all_assets};
 /// ```
 #[allow(clippy::module_name_repetitions)]
 pub struct EmbeddedAssetReader {
-    loaded: HashMap<&'static Path, &'static [u8]>,
+    /// Embedded bytes and whether they are compressed.
+    loaded: HashMap<&'static Path, (&'static [u8], bool)>,
     fallback: Option<Box<dyn ErasedAssetReader>>,
+    key: Option<codec::Key>,
 }
 
 impl std::fmt::Debug for EmbeddedAssetReader {
@@ -55,8 +58,13 @@ impl Default for EmbeddedAssetReader {
 }
 
 impl EmbeddedRegistry for &mut EmbeddedAssetReader {
-    fn insert_included_asset(&mut self, name: &'static str, bytes: &'static [u8]) {
-        self.add_asset(Path::new(name), bytes);
+    fn insert_included_asset(
+        &mut self,
+        name: &'static str,
+        bytes: &'static [u8],
+        compressed: bool,
+    ) {
+        self.loaded.insert(Path::new(name), (bytes, compressed));
     }
 }
 
@@ -67,6 +75,7 @@ impl EmbeddedAssetReader {
         Self {
             loaded: HashMap::default(),
             fallback: None,
+            key: None,
         }
     }
 
@@ -77,10 +86,7 @@ impl EmbeddedAssetReader {
     /// calling `preloaded` with [`EmbeddedAssetReader::load_path_sync()`].
     #[must_use]
     pub fn preloaded() -> Self {
-        let mut new = Self {
-            loaded: HashMap::default(),
-            fallback: None,
-        };
+        let mut new = Self::new();
         include_all_assets(&mut new);
         new
     }
@@ -91,28 +97,68 @@ impl EmbeddedAssetReader {
         mut default: impl FnMut() -> Box<dyn ErasedAssetReader> + Send + Sync + 'static,
     ) -> Self {
         let mut new = Self {
-            loaded: HashMap::default(),
             fallback: Some(default()),
+            ..Self::new()
         };
         include_all_assets(&mut new);
         new
     }
 
     /// Add an asset to this [`EmbeddedAssetReader`].
+    #[cfg(test)]
     pub(crate) fn add_asset(&mut self, path: &'static Path, data: &'static [u8]) {
-        self.loaded.insert(path, data);
+        self.loaded.insert(path, (data, false));
+    }
+
+    /// Set the passphrase used to decrypt assets.
+    #[cfg(feature = "encryption")]
+    #[must_use]
+    pub fn with_key(self, passphrase: &str) -> Self {
+        self.with_key_opt(Some(codec::derive_key(passphrase)))
+    }
+
+    pub(crate) fn with_key_opt(mut self, key: Option<codec::Key>) -> Self {
+        self.key = key;
+        self
     }
 
     /// Get the data from the asset matching the path provided.
     ///
     /// # Errors
     ///
-    /// This will returns an error if the path is not known.
+    /// This will returns an error if the path is not known, or if the asset is compressed or
+    /// encrypted. Use [`EmbeddedAssetReader::load_bytes_sync()`] for those.
     pub fn load_path_sync(&self, path: &Path) -> Result<DataReader, AssetReaderError> {
-        self.loaded
+        match self.load_bytes_sync(path)? {
+            Cow::Borrowed(bytes) => Ok(DataReader(bytes)),
+            Cow::Owned(_) => Err(AssetReaderError::Io(
+                std::io::Error::other(
+                    "asset is compressed or encrypted, use EmbeddedAssetReader::load_bytes_sync",
+                )
+                .into(),
+            )),
+        }
+    }
+
+    /// Get the data from the asset matching the path provided, decrypted and decompressed.
+    ///
+    /// # Errors
+    ///
+    /// This will returns an error if the path is not known, or if the asset can't be decoded.
+    pub fn load_bytes_sync(&self, path: &Path) -> Result<Cow<'static, [u8]>, AssetReaderError> {
+        let (bytes, compressed) = self
+            .loaded
             .get(path)
-            .map(|b| DataReader(b))
-            .ok_or_else(|| AssetReaderError::NotFound(path.to_path_buf()))
+            .ok_or_else(|| AssetReaderError::NotFound(path.to_path_buf()))?;
+        codec::decode(bytes, *compressed, self.key.as_ref())
+            .map_err(|err| AssetReaderError::Io(err.into()))
+    }
+
+    fn reader_for(&self, path: &Path) -> Result<Box<dyn Reader>, AssetReaderError> {
+        Ok(match self.load_bytes_sync(path)? {
+            Cow::Borrowed(bytes) => Box::new(DataReader(bytes)),
+            Cow::Owned(bytes) => Box::new(VecReader::new(bytes)),
+        })
     }
 
     fn has_file_sync(&self, path: &Path) -> bool {
@@ -224,10 +270,7 @@ impl AssetReader for EmbeddedAssetReader {
     // async fn read<'a>(&'a self, path: &'a Path) -> Result<Box<dyn Reader>, AssetReaderError> {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
         if self.has_file_sync(path) {
-            self.load_path_sync(path).map(|reader| {
-                let boxed: Box<dyn Reader> = Box::new(reader);
-                boxed
-            })
+            self.reader_for(path)
         } else if let Some(fallback) = self.fallback.as_ref() {
             fallback.read(path).await
         } else {
@@ -238,10 +281,7 @@ impl AssetReader for EmbeddedAssetReader {
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
         let meta_path = get_meta_path(path);
         if self.has_file_sync(&meta_path) {
-            self.load_path_sync(&meta_path).map(|reader| {
-                let boxed: Box<dyn Reader> = Box::new(reader);
-                boxed
-            })
+            self.reader_for(&meta_path)
         } else if let Some(fallback) = self.fallback.as_ref() {
             fallback.read_meta(path).await
         } else {
@@ -275,6 +315,7 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(feature = "encryption", ignore = "assets are encrypted")]
     fn load_path() {
         let mut embedded = EmbeddedAssetReader::new();
         embedded.add_asset(Path::new("asset.png"), &[1, 2, 3]);
@@ -337,6 +378,7 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(feature = "encryption", ignore = "assets are encrypted")]
     fn check_preloaded_simple() {
         let embedded = EmbeddedAssetReader::preloaded();
 
@@ -351,6 +393,7 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(feature = "encryption", ignore = "assets are encrypted")]
     fn check_preloaded_special_chars() {
         let embedded = EmbeddedAssetReader::preloaded();
 
@@ -368,6 +411,7 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(feature = "encryption", ignore = "assets are encrypted")]
     fn check_preloaded_subdir() {
         let embedded = EmbeddedAssetReader::preloaded();
 
